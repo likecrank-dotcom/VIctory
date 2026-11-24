@@ -129,6 +129,9 @@ mod tests {
             height: 1,
             rgba: vec![30, 40, 50, 255, 170, 160, 150, 255],
             color: true,
+            source_resource: None,
+            source_format: None,
+            depth_draws: None,
         };
         let mut bytes = [0xff; 48];
         scale_rgba(&image, &mut bytes, 4, 2, 24, false);

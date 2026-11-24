@@ -261,6 +261,9 @@ pub(crate) fn sample(host: &Host, frame: u64, presented_resource: usize) {
                 height,
                 rgba,
                 color: true,
+                source_resource: Some(*guest),
+                source_format: Some(target.format.0 as u32),
+                depth_draws: Some(target.depth_draws),
             }));
             tracing::info!(
                 frame,

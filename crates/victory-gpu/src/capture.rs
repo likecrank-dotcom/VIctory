@@ -79,6 +79,14 @@ pub(crate) fn wanted(n: u64) -> bool {
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
+    let path = folder.join(format!("{name}.png"));
+    match write_png(&path, width, height, pitch, bgra, rows) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+fn write_png(path: &std::path::Path, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) -> std::io::Result<()> {
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Each row starts with a zero filter byte, followed by downsampled RGB.
     let row_bytes = w as usize * 3 + 1;
@@ -106,11 +114,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
         &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
     );
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    std::fs::write(path, png)
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -370,6 +374,9 @@ pub(crate) struct ScenePreview {
     pub(crate) height: u32,
     pub(crate) rgba: Vec<u8>,
     pub(crate) color: bool,
+    pub(crate) source_resource: Option<usize>,
+    pub(crate) source_format: Option<u32>,
+    pub(crate) depth_draws: Option<u32>,
 }
 
 const DEPTH_SAMPLE_GAP: u64 = 4;
@@ -507,6 +514,9 @@ pub(crate) fn sample_scene_depth(frame: u64) {
                 height,
                 rgba,
                 color: false,
+                source_resource: None,
+                source_format: None,
+                depth_draws: None,
             }));
             tracing::info!(frame, width, height, "live scene depth preview updated");
         }
@@ -898,3 +908,66 @@ mod tests {
 
 }
 
+
+/// Saves each newly selected preview after its present succeeds. The ring holds
+/// 128 source PNGs and matching metadata, independently of periodic final captures.
+/// These are normalized source pixels before swap-chain resizing/compositing.
+pub(crate) fn archive_preview(present_frame: u64, image: &ScenePreview) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if !*ENABLED.get_or_init(|| std::env::var("VICTORY_CAPTURE_PREVIEW").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    let Some(folder) = folder() else { return };
+    let directory = folder.join("preview-ring");
+    let sequence = NEXT.fetch_add(1, Relaxed);
+    let slot = sequence % 128;
+    let result = write_preview_archive(&directory, sequence, present_frame, image);
+    match result {
+        Ok(()) => tracing::info!(sequence, slot, present_frame, source_frame = image.frame, "preview archived"),
+        Err(error) => tracing::warn!(%error, sequence, slot, "preview archive failed"),
+    }
+}
+
+fn write_preview_archive(directory: &std::path::Path, sequence: u64, present_frame: u64, image: &ScenePreview) -> std::io::Result<()> {
+    let slot = sequence % 128;
+    std::fs::create_dir_all(&directory)?;
+    let stem = format!("slot-{slot:03}");
+    write_png(&directory.join(format!("{stem}.png")), image.width, image.height,
+        image.width as usize * 4, false, &image.rgba)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_millis();
+    let kind = if image.color { "color" } else { "depth" };
+    let resource = image.source_resource.map(|v| format!("\"{v:#x}\""))
+        .unwrap_or_else(|| "null".into());
+    let format = image.source_format.map(|v| v.to_string()).unwrap_or_else(|| "null".into());
+    let draws = image.depth_draws.map(|v| v.to_string()).unwrap_or_else(|| "null".into());
+    let metadata = format!("{{\"sequence\":{sequence},\"slot\":{slot},\"present_frame\":{present_frame},\"source_frame\":{},\"unix_ms\":{now},\"kind\":\"{kind}\",\"resource\":{resource},\"format\":{format},\"depth_draws\":{draws},\"width\":{},\"height\":{},\"pixels\":\"normalized source, half-size RGB PNG\",\"present_result\":\"S_OK\"}}\n", image.frame, image.width, image.height);
+    std::fs::write(directory.join(format!("{stem}.json")), metadata)
+}
+
+#[cfg(test)]
+mod preview_archive_tests {
+    #[test]
+    fn archive_wraps_without_mixing_source_metadata_and_pixels() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut image = super::ScenePreview {
+            frame: 0, width: 4, height: 4, rgba: vec![127; 4 * 4 * 4], color: true,
+            source_resource: Some(0x1234), source_format: Some(28), depth_draws: Some(64),
+        };
+        for sequence in 0..129 {
+            image.frame = sequence * 10;
+            super::write_preview_archive(directory.path(), sequence, sequence * 10 + 1, &image).unwrap();
+        }
+        let files: Vec<_> = std::fs::read_dir(directory.path()).unwrap().collect();
+        assert_eq!(files.len(), 256);
+        let png = std::fs::read(directory.path().join("slot-000.png")).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 2);
+        let metadata = std::fs::read_to_string(directory.path().join("slot-000.json")).unwrap();
+        assert!(metadata.contains("\"sequence\":128"));
+        assert!(metadata.contains("\"source_frame\":1280"));
+        assert!(metadata.contains("\"present_frame\":1281"));
+        assert!(metadata.contains("\"resource\":\"0x1234\""));
+    }
+}
