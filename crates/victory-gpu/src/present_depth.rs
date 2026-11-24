@@ -1,15 +1,16 @@
-//! Uploads the live diagnostics depth preview to the window's back buffer.
+//! Uploads a live diagnostics scene preview to the window's back buffer.
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
 };
 
-use crate::capture::SceneDepthPreview;
+use crate::capture::ScenePreview;
 use crate::host::Host;
 
 pub(crate) struct PreviewUpload {
     pub(crate) frame: u64,
+    pub(crate) color: bool,
     buffer: ID3D12Resource,
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 }
@@ -20,7 +21,7 @@ impl PreviewUpload {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-        image: &SceneDepthPreview,
+        image: &ScenePreview,
     ) -> Option<Self> {
         if !matches!(
             format,
@@ -45,15 +46,17 @@ impl PreviewUpload {
         // SAFETY: the new upload buffer is mapped for writes, has `len`
         // bytes, and no GPU command references it yet.
         let destination = unsafe { std::slice::from_raw_parts_mut(data, len) };
-        scale_gray(
+        scale_rgba(
             image,
             destination,
             width as usize,
             height as usize,
             pitch as usize,
+            format == DXGI_FORMAT_B8G8R8A8_UNORM,
         );
         Some(Self {
             frame: image.frame,
+            color: image.color,
             buffer,
             footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                 Offset: 0,
@@ -68,7 +71,7 @@ impl PreviewUpload {
         })
     }
 
-    /// Copy the uploaded RGBA8 or BGRA8 grayscale into a copy-dest back buffer.
+    /// Copy the uploaded RGBA8 or BGRA8 pixels into a copy-dest back buffer.
     pub(crate) fn copy_to(&self, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource) {
         // SAFETY: the locations borrow the live resources. D3D12's copy
         // location suppresses dropping its embedded resource pointer.
@@ -92,12 +95,13 @@ impl PreviewUpload {
     }
 }
 
-fn scale_gray(
-    image: &SceneDepthPreview,
+fn scale_rgba(
+    image: &ScenePreview,
     out: &mut [u8],
     width: usize,
     height: usize,
     pitch: usize,
+    bgra: bool,
 ) {
     let (source_width, source_height) = (image.width as usize, image.height as usize);
     let columns: Vec<_> = (0..width).map(|x| 4 * (x * source_width / width)).collect();
@@ -105,8 +109,10 @@ fn scale_gray(
         let from = (y * source_height / height) * source_width * 4;
         let source = &image.rgba[from..from + source_width * 4];
         for (pixel, &column) in row[..width * 4].chunks_exact_mut(4).zip(&columns) {
-            let v = source[column];
-            pixel.copy_from_slice(&[v, v, v, 255]);
+            let (r, g, b) = (source[column], source[column + 1], source[column + 2]);
+            let rgb = if bgra { [b, g, r] } else { [r, g, b] };
+            pixel[..3].copy_from_slice(&rgb);
+            pixel[3] = 255;
         }
     }
 }
@@ -117,20 +123,24 @@ mod tests {
 
     #[test]
     fn a_preview_scales_into_padded_rows() {
-        let image = SceneDepthPreview {
+        let image = ScenePreview {
             frame: 1,
             width: 2,
             height: 1,
-            rgba: vec![30, 30, 30, 255, 170, 170, 170, 255],
+            rgba: vec![30, 40, 50, 255, 170, 160, 150, 255],
+            color: true,
         };
         let mut bytes = [0xff; 48];
-        scale_gray(&image, &mut bytes, 4, 2, 24);
+        scale_rgba(&image, &mut bytes, 4, 2, 24, false);
         for row in bytes.chunks_exact(24) {
-            assert_eq!(&row[..4], &[30, 30, 30, 255]);
+            assert_eq!(&row[..4], &[30, 40, 50, 255]);
             assert_eq!(&row[4..8], &row[..4]);
-            assert_eq!(&row[8..12], &[170, 170, 170, 255]);
+            assert_eq!(&row[8..12], &[170, 160, 150, 255]);
             assert_eq!(&row[12..16], &row[8..12]);
             assert_eq!(&row[16..], &[0xff; 8]);
         }
+        scale_rgba(&image, &mut bytes, 4, 2, 24, true);
+        assert_eq!(&bytes[..4], &[50, 40, 30, 255]);
+        assert_eq!(&bytes[8..12], &[150, 160, 170, 255]);
     }
 }

@@ -42,6 +42,8 @@ pub mod query;
 pub mod queue;
 pub mod resource;
 pub mod root;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod scene_color;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
