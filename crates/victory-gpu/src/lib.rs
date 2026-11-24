@@ -34,6 +34,8 @@ mod indirect;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod present_depth;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

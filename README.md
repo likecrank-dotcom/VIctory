@@ -129,6 +129,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_PREVIEW_SCENE_DEPTH=1` | shows qualifying D3D12 scene depth as grayscale in RGBA8 or BGRA8 swap chains. With `VICTORY_CAPTURE`, saves the first three preview frames and their original color frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |

@@ -459,7 +459,10 @@ impl State {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
+            {
+                crate::capture::note_target(record.resource);
+                crate::capture::note_scene_depth(record.resource);
+            }
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.

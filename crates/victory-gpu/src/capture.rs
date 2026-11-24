@@ -3,7 +3,10 @@
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -71,11 +74,6 @@ fn poll_request(
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     folder().is_some() && (n.is_power_of_two() || listed(n))
-}
-
-/// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
-pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
@@ -158,13 +156,20 @@ pub(crate) fn read_back(
             Some(&mut total),
         );
     }
+    if total == u64::MAX {
+        return None;
+    }
+    // Our CPU readers take a slice of complete pitched rows, including
+    // padding in the last row that the GPU copy does not require.
+    let f = footprint.Footprint;
+    let pitched_bytes = u64::from(f.RowPitch) * u64::from(f.Height);
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
     };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: total,
+        Width: total.max(pitched_bytes),
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -214,6 +219,23 @@ pub(crate) fn save_read_back(
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
+    save_color_readback(&format!("frame-{frame}"), buffer, footprint);
+}
+
+/// Saves the preview actually copied into the swap chain's back buffer.
+pub(crate) fn save_presented_depth(
+    frame: u64,
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
+    save_color_readback(&format!("frame-{frame}-presented-depth"), buffer, footprint);
+}
+
+fn save_color_readback(
+    name: &str,
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
@@ -232,7 +254,7 @@ pub(crate) fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        save_as(name, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
     }
 }
@@ -304,7 +326,6 @@ pub(crate) fn note_target(resource: crate::object::This) {
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
@@ -316,20 +337,176 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        if let Some((width, height, rgba)) = dump_target_rgba(host, texture, state) {
+            let name = format!(
+                "frame-{frame}-{i:02}-{resource:#x}-{}x{}-f{}",
+                d.Width, d.Height, d.Format.0,
+            );
+            save_as(&name, width, height, width as usize * 4, false, &rgba);
+        }
     }
 }
 
-fn dump_one(
+/// The latest usable depth sample, converted to tightly packed RGBA8.
+pub(crate) struct SceneDepthPreview {
+    pub(crate) frame: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
+}
+
+const DEPTH_SAMPLE_GAP: u64 = 4;
+const MAX_DEPTH_CANDIDATES: usize = 256;
+static NEXT_DEPTH_SAMPLE: AtomicU64 = AtomicU64::new(32);
+static SCENE_DEPTH: Mutex<SceneDepthCapture> = Mutex::new(SceneDepthCapture {
+    presented: 0,
+    drawn: 0,
+    dispatched: 0,
+    pending: BTreeMap::new(),
+    latest: None,
+});
+
+struct SceneDepthCapture {
+    presented: u64,
+    drawn: u64,
+    dispatched: u64,
+    pending: BTreeMap<u64, DepthCandidates>,
+    latest: Option<Arc<SceneDepthPreview>>,
+}
+
+#[derive(Default)]
+struct DepthCandidates {
+    seen: HashSet<usize>,
+    largest: Option<(u64, Arc<crate::resource::HostTexture>)>,
+}
+
+fn scene_depth_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("VICTORY_PREVIEW_SCENE_DEPTH").as_deref(), Ok("1")))
+}
+
+pub(crate) fn scene_depth_preview() -> Option<Arc<SceneDepthPreview>> {
+    if !scene_depth_on() {
+        return None;
+    }
+    SCENE_DEPTH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .latest
+        .clone()
+}
+
+/// Keep the largest eligible depth target bound for the frame being built.
+pub(crate) fn note_scene_depth(resource: crate::object::This) {
+    if !scene_depth_on() {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    if frame < NEXT_DEPTH_SAMPLE.load(Relaxed) {
+        return;
+    }
+    let mut capture = SCENE_DEPTH.lock().unwrap_or_else(|e| e.into_inner());
+    // A recording thread may already be building the next frame.
+    if frame <= capture.presented
+        || frame > capture.presented.saturating_add(2)
+        || frame < NEXT_DEPTH_SAMPLE.load(Relaxed)
+    {
+        return;
+    }
+    let candidates = capture.pending.entry(frame).or_default();
+    if candidates.seen.len() >= MAX_DEPTH_CANDIDATES || !candidates.seen.insert(resource as usize) {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(resource) else { return };
+    // SAFETY: the host texture is kept alive by the Arc.
+    let desc = unsafe { copy.texture.GetDesc() };
+    let (width, height) = (desc.Width, u64::from(desc.Height));
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.SampleDesc.Count != 1
+        || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        || !matches!(desc.Format.0, 19..=22 | 39..=47)
+        || !(640..=4096).contains(&width)
+        || !(360..=2304).contains(&height)
+        || !(14 * height..=24 * height).contains(&(10 * width))
+    {
+        return;
+    }
+    let area = width * height;
+    if candidates.largest.as_ref().is_none_or(|(largest, _)| area > *largest) {
+        candidates.largest = Some((area, copy));
+    }
+}
+
+/// At PresentX, read the submitted depth if host rendering reached a scene.
+pub(crate) fn sample_scene_depth(frame: u64) {
+    if !scene_depth_on() {
+        return;
+    }
+    let texture = {
+        let mut capture = SCENE_DEPTH.lock().unwrap_or_else(|e| e.into_inner());
+        if frame <= capture.presented {
+            return;
+        }
+        capture.presented = frame;
+        let drawn = crate::draw::drawn();
+        let dispatched = crate::draw::dispatched();
+        let draws = drawn.saturating_sub(std::mem::replace(&mut capture.drawn, drawn));
+        let dispatches =
+            dispatched.saturating_sub(std::mem::replace(&mut capture.dispatched, dispatched));
+        let candidates = capture.pending.remove(&frame);
+        capture.pending.retain(|&pending, _| pending > frame);
+        if frame < NEXT_DEPTH_SAMPLE.load(Relaxed)
+            || draws < 64
+            || (draws < 128 && dispatches < 16)
+        {
+            return;
+        }
+        let Some((_, texture)) = candidates.and_then(|candidates| candidates.largest) else {
+            return;
+        };
+        let next = frame.saturating_add(DEPTH_SAMPLE_GAP);
+        NEXT_DEPTH_SAMPLE.store(next, Relaxed);
+        capture.pending.retain(|&pending, _| pending >= next);
+        texture
+    };
+    let Some(host) = crate::host::host() else { return };
+    let Ok(list) = host.new_list() else { return };
+    // This is the only use in this list. Its prelude moves the depth
+    // target to COPY_SOURCE under the host submission lock. Later title
+    // lists transition it back to their required state at submission.
+    let _ = list.track_texture_state(texture.clone(), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+    let Some(readback) = read_back(&host.device, &list.list, &texture.texture) else {
+        return;
+    };
+    let Some((width, height, rgba)) = read_target_rgba(host, &list, readback) else {
+        return;
+    };
+    if usable_depth(&rgba) {
+        let mut capture = SCENE_DEPTH.lock().unwrap_or_else(|e| e.into_inner());
+        if capture.latest.as_ref().is_none_or(|last| last.frame < frame) {
+            capture.latest = Some(Arc::new(SceneDepthPreview { frame, width, height, rgba }));
+            tracing::info!(frame, width, height, "live scene depth preview updated");
+        }
+    }
+}
+
+/// Keep the last usable sample when a target was cleared or holds sparse noise.
+fn usable_depth(rgba: &[u8]) -> bool {
+    let mut bins = [0usize; 16];
+    for pixel in rgba.chunks_exact(4).step_by(31) {
+        bins[usize::from(pixel[0] >> 4)] += 1;
+    }
+    let count: usize = bins.iter().sum();
+    let peak = bins.into_iter().max().unwrap_or(0);
+    count - peak >= count.div_ceil(512).max(16)
+}
+
+fn dump_target_rgba(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
     state: u32,
-    frame: u64,
-    i: usize,
-    resource: crate::object::This,
-    d: &D3D12_RESOURCE_DESC,
-) {
-    let Ok(list) = host.new_list() else { return };
+) -> Option<(u32, u32, Vec<u8>)> {
+    let list = host.new_list().ok()?;
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.
@@ -345,29 +522,35 @@ fn dump_one(
         }
         read
     };
+    read_target_rgba(host, &list, read?)
+}
+
+fn read_target_rgba(
+    host: &crate::host::Host,
+    list: &crate::host::HostList,
+    (buffer, footprint): (ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT),
+) -> Option<(u32, u32, Vec<u8>)> {
     list.close();
-    host.execute(&[&list]);
-    let Some((buffer, footprint)) = read else { return };
+    host.execute(&[list]);
+    if !host.capture_completed() {
+        tracing::warn!("target readback fence did not complete");
+        return None;
+    }
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows.
-    unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
-        }
+    // SAFETY: the copy finished and read_back allocated the full pitched rows.
+    let rgba = unsafe {
+        buffer.Map(0, None, Some(&mut data)).ok()?;
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
-        } else {
-            tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
-        }
+        let rgba = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows);
         buffer.Unmap(0, None);
+        rgba
+    };
+    if rgba.is_none() {
+        tracing::info!(format = f.Format.0, "target not dumped: format");
     }
+    rgba.map(|rgba| (f.Width, f.Height, rgba))
 }
 
 fn half(h: u16) -> f32 {
