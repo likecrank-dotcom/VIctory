@@ -618,4 +618,34 @@ mod tests {
         assert!(shadow.before.lock().unwrap().pages.is_empty());
         drop(memory);
     }
+
+    /// Refreshing an undeclared gap inside one snapshot page must not be
+    /// mistaken for a GPU write and overwrite a later CPU write.
+    #[test]
+    fn refreshed_gap_inside_a_page_keeps_the_titles_newer_byte() {
+        let mut memory = vec![0u8; 3 * PAGE];
+        let base = (memory.as_mut_ptr() as usize).next_multiple_of(PAGE);
+        let Some(shadow) = shadow_of(base, PAGE) else { return };
+        shadow.writing(base, 16);
+        shadow.writing(base + 128, 16);
+        // SAFETY: these bytes belong to the test and its mapped copy.
+        unsafe {
+            (base as *mut u8).add(64).write(1);
+            shadow.data.add(64).write(1); // mimic the middle range's refresh
+        }
+        shadow.writing(base + 64, 16);
+        // SAFETY: the CPU changes the middle byte after the snapshot; an
+        // actual GPU change is mimicked in the first range.
+        unsafe {
+            (base as *mut u8).add(64).write(2);
+            shadow.data.add(3).write(9);
+        }
+        for at in [base, base + 128, base + 64] { shadow.copy_back(at, 16); }
+        // SAFETY: still inside memory, which remains live for this test.
+        unsafe {
+            assert_eq!((base as *const u8).add(64).read(), 2, "CPU's newer byte");
+            assert_eq!((base as *const u8).add(3).read(), 9, "GPU's actual write");
+        }
+    }
+
 }
