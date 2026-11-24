@@ -2614,9 +2614,10 @@ impl Host {
             }
         }
         #[cfg(feature = "diagnostics")]
-        let new_preview = match crate::scene_color::preview(frame)
-            .or_else(crate::capture::scene_depth_preview)
-        {
+        let preview_image = crate::scene_color::preview(frame)
+            .or_else(crate::capture::scene_depth_preview);
+        #[cfg(feature = "diagnostics")]
+        let new_preview = match preview_image.as_ref() {
             Some(image) if p.preview_upload.as_ref().is_none_or(|upload|
                 (upload.frame, upload.color) != (image.frame, image.color)) => {
                 p.preview_upload =
@@ -2859,6 +2860,9 @@ impl Host {
                 && status == windows::Win32::Foundation::S_OK
                 && let Some((source_frame, color)) = new_preview
             {
+                if let Some(image) = preview_image.as_ref() {
+                    crate::capture::archive_preview(frame, image);
+                }
                 if color {
                     tracing::info!(frame, source_frame, width, height, native_format = primary_desc.Format.0,
                         "live scene color presented to game window");
