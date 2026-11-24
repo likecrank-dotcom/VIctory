@@ -3421,46 +3421,64 @@ impl<'a> Lower<'a> {
         };
         let use_at =
             uses(&|load| load == site).or_else(|| uses(&|load| self.twin_loads(site, load)));
-        let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
+        let (first, src, props, image, uav) = if let Some((at, first)) = use_at {
+            let src = Source::Loaded { load: site, first };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let uav = un.contains("store")
+                || un.contains("atomic")
+                || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            let (props, image) = match &ui.fields {
+                Fields::Image { dim, .. } => {
+                    let kind = match dim {
+                        0 => 1,
+                        1 => 2,
+                        2 => 4,
+                        4 => 6,
+                        5 => 7,
+                        _ => return Err("an image dimension (cube or MSAA)"),
+                    };
+                    ((kind | u, 0x409), Some(kind))
                 }
-                (props, None)
+                Fields::Buffer { idxen, format, .. } => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if un.starts_with("buffer_load_format")
+                        || un.starts_with("buffer_store_format")
+                    {
+                        (10 | u, 0x409)
+                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
+                    {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    (props, None)
+                }
+                _ => return Err("a scalar memory read as data"),
+            };
+            (first, src, props, image, uav)
+        } else {
+            // An image the program only measures (it reads the size bits and
+            // samples the image in other programs): eight dwords are an image
+            // descriptor, taken here as a 2D texture.
+            // shortcut: a 3D or array image would report depth or layers 1.
+            let src = Source::Loaded {
+                load: site,
+                first: 0,
+            };
+            if count != 8
+                || self
+                    .used_kind(&src)
+                    .is_some_and(|u| u.kind != ResourceType::Srv)
+            {
+                return Err("a descriptor read only as data");
             }
-            _ => return Err("a scalar memory read as data"),
+            (0, src, (2, 0x409), Some(2), false)
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -7454,6 +7472,29 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// A dword a scalar load writes, where the load is a descriptor the
+    /// program uses as a resource or sampler.
+    fn descriptor_dword(&self, v: Value) -> bool {
+        let Some(load) = self.x.p.blocks.iter().enumerate().find_map(|(b, block)| {
+            block
+                .insts
+                .iter()
+                .position(|i| i.writes.iter().any(|w| w.1 == v))
+                .map(|i| (b, i))
+        }) else {
+            return false;
+        };
+        self.x.p.blocks[load.0].insts[load.1]
+            .name()
+            .starts_with("s_load_dword")
+            && self.x.res.descriptors.iter().any(|d| {
+                d.source
+                    .leaves()
+                    .iter()
+                    .any(|l| matches!(l, Source::Loaded { load: at, .. } if *at == load))
+            })
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
@@ -7468,6 +7509,17 @@ impl<'a> Lower<'a> {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                    }
+                    // A descriptor's dwords reaching a join that also takes
+                    // data (the registers are reused after the last access).
+                    // shortcut: undefined on that edge, assuming the program
+                    // reads the joined value only after the data edge.
+                    (Some(Val::Missing(_)), _) if self.descriptor_dword(arg) => {
+                        if bit {
+                            self.s.m.undef(self.s.t.i1)
+                        } else {
+                            self.s.m.undef(self.s.t.i32)
+                        }
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
