@@ -179,6 +179,9 @@ impl Shadow {
         if from >= to || before.spans.iter().any(|&(a, b)| a <= from && to <= b) {
             return;
         }
+        // An earlier snapshot can span a gap that was not declared yet.
+        // Capture its refresh now, rather than treat it as a later GPU write.
+        let fresh = outside(from, to, before.spans.clone());
         let (mut a, mut b) = (from, to);
         before.spans.retain(|&(x, y)| {
             let meets = x <= b && a <= y;
@@ -197,6 +200,7 @@ impl Shadow {
                 hi: lo,
                 bytes: page_buffer(),
             });
+            let previous = (snap.lo, snap.hi);
             if lo < snap.lo {
                 snap.bytes[lo..snap.lo].copy_from_slice(host(page, lo, snap.lo));
                 snap.lo = lo;
@@ -205,6 +209,18 @@ impl Shadow {
                 let from = snap.hi.max(snap.lo);
                 snap.bytes[from..hi].copy_from_slice(host(page, from, hi));
                 snap.hi = hi;
+            }
+            // Newly covered edges were copied above. Refresh only fresh
+            // portions inside the old extent; previously declared bytes
+            // must keep the original snapshot across overlapping ranges.
+            let page_start = page * PAGE;
+            for &(a, b) in &fresh {
+                let a = (start + a).max(page_start + previous.0);
+                let b = (start + b).min(page_start + previous.1);
+                if a < b {
+                    let (a, b) = (a - page_start, b - page_start);
+                    snap.bytes[a..b].copy_from_slice(host(page, a, b));
+                }
             }
             at += hi - lo;
         }
@@ -396,6 +412,20 @@ impl Shadow {
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
     }
+}
+
+/// Portions not yet declared by this submission, in copy-relative offsets.
+fn outside(from: usize, to: usize, mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let (mut at, mut parts) = (from, Vec::new());
+    for (a, b) in ranges {
+        if at < to && a > at {
+            parts.push((at, a.min(to)));
+        }
+        at = at.max(b);
+    }
+    if at < to { parts.push((at, to)); }
+    parts
 }
 
 struct Entry {
