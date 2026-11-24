@@ -36,21 +36,36 @@ pub(crate) fn listed(n: u64) -> bool {
 /// and keep its result until the frame changes.
 fn requested(n: u64) -> bool {
     static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    static FRAME: std::sync::Mutex<(u64, bool)> = std::sync::Mutex::new((u64::MAX, false));
+    static FRAMES: std::sync::Mutex<std::collections::BTreeMap<u64, bool>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
     let Some(path) = PATH.get_or_init(|| {
         std::env::var_os("VICTORY_CAPTURE_REQUEST_FILE").map(PathBuf::from)
     }) else {
         return false;
     };
-    let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
-    if frame.0 != n {
-        let capture = std::fs::remove_file(path).is_ok();
-        *frame = (n, capture);
-        if capture {
-            tracing::info!(frame = n, "one-shot frame capture requested");
-        }
+    let mut frames = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    poll_request(&mut frames, n, path)
+}
+
+fn poll_request(
+    frames: &mut std::collections::BTreeMap<u64, bool>,
+    n: u64,
+    path: &std::path::Path,
+) -> bool {
+    if let Some(&capture) = frames.get(&n) {
+        return capture;
     }
-    frame.1
+    let capture = std::fs::remove_file(path).is_ok();
+    frames.insert(n, capture);
+    // Recording the next frame and presenting the preceding one can
+    // interleave. Keep their decisions, with a small bounded history.
+    while frames.len() > 8 {
+        frames.pop_first();
+    }
+    if capture {
+        tracing::info!(frame = n, "one-shot frame capture requested");
+    }
+    capture
 }
 
 /// Whether frame `n` is saved.
@@ -561,5 +576,28 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    #[test]
+    fn a_capture_request_survives_interleaved_recording_and_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.request");
+        let mut frames = std::collections::BTreeMap::new();
+        assert!(!super::poll_request(&mut frames, 10, &path));
+        std::fs::write(&path, []).unwrap();
+        // A request arriving mid-frame waits for the next complete frame.
+        assert!(!super::poll_request(&mut frames, 10, &path));
+        assert!(path.exists());
+        assert!(super::poll_request(&mut frames, 11, &path));
+        assert!(!path.exists());
+        // Presenting the preceding frame cannot erase the next decision.
+        assert!(!super::poll_request(&mut frames, 10, &path));
+        assert!(super::poll_request(&mut frames, 11, &path));
+        assert!(!super::poll_request(&mut frames, 12, &path));
+        std::fs::write(&path, []).unwrap();
+        assert!(super::poll_request(&mut frames, 11, &path));
+        assert!(path.exists());
+        assert!(super::poll_request(&mut frames, 13, &path));
+        assert!(!path.exists());
     }
 }
