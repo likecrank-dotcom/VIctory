@@ -26,7 +26,31 @@ pub(crate) fn listed(n: u64) -> bool {
             .filter_map(|f| f.trim().parse().ok())
             .collect()
     })
-    .contains(&n)
+    .contains(&n) || requested(n)
+}
+
+/// An optional one-shot request lets a tester capture after reaching the
+/// scene, whose frame number depends on loading time. Create the file
+/// named by `VICTORY_CAPTURE_REQUEST_FILE` to capture the next frame.
+/// All draws and the present must agree: consume at most once per frame
+/// and keep its result until the frame changes.
+fn requested(n: u64) -> bool {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    static FRAME: std::sync::Mutex<(u64, bool)> = std::sync::Mutex::new((u64::MAX, false));
+    let Some(path) = PATH.get_or_init(|| {
+        std::env::var_os("VICTORY_CAPTURE_REQUEST_FILE").map(PathBuf::from)
+    }) else {
+        return false;
+    };
+    let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
+    if frame.0 != n {
+        let capture = std::fs::remove_file(path).is_ok();
+        *frame = (n, capture);
+        if capture {
+            tracing::info!(frame = n, "one-shot frame capture requested");
+        }
+    }
+    frame.1
 }
 
 /// Whether frame `n` is saved.
