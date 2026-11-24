@@ -818,7 +818,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -1149,7 +1152,13 @@ mod host {
 
         fn keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
+            let mut down = {
+                let mut keys = scripted();
+                keys.extend(file_keys());
+                keys.sort_unstable();
+                keys.dedup();
+                keys
+            };
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
             if focused() {
@@ -1184,6 +1193,71 @@ mod host {
         }
     }
 
+    /// An opt-in diagnostics control file contains comma-separated virtual-key
+    /// names. A changed file holds those keys for at most ten seconds; an empty
+    /// file releases them. The timeout avoids a stuck stick if a tester stops.
+    #[cfg(feature = "diagnostics")]
+    fn file_keys() -> Vec<u8> {
+        struct Control {
+            checked: Instant,
+            modified: Option<std::time::SystemTime>,
+            until: Instant,
+            keys: Vec<u8>,
+        }
+        static PATH: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").map(Into::into));
+        static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
+            Mutex::new(Control {
+                checked: Instant::now() - Duration::from_secs(1),
+                modified: None,
+                until: Instant::now(),
+                keys: Vec::new(),
+            })
+        });
+        let Some(path) = PATH.as_ref() else {
+            return Vec::new();
+        };
+        let mut control = lock(&CONTROL);
+        let now = Instant::now();
+        if now.duration_since(control.checked) >= Duration::from_millis(50) {
+            control.checked = now;
+            let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            if modified != control.modified {
+                control.modified = modified;
+                control.keys = std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|k| virtual_key(k.trim()))
+                    .collect();
+                control.until = now + Duration::from_secs(10);
+                tracing::info!(keys = ?control.keys, "diagnostics input file changed; maximum hold 10 s");
+            }
+        }
+        if now < control.until {
+            control.keys.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn virtual_key(key: &str) -> Option<u8> {
+        Some(match key {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
@@ -1194,20 +1268,7 @@ mod host {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = virtual_key(key.trim())?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
@@ -1564,7 +1625,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1573,7 +1643,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
