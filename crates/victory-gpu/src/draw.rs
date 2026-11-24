@@ -63,6 +63,8 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    #[cfg(feature = "diagnostics")]
+    target_views: Vec<Option<D3D12_RENDER_TARGET_VIEW_DESC>>,
     depth: usize,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
@@ -437,6 +439,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        #[cfg(feature = "diagnostics")]
+        self.target_views.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -450,9 +454,15 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            let desc = record.desc();
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            {
+                if crate::scene_color::enabled() {
+                    self.target_views.push(desc);
+                }
+                crate::capture::note_target(record.resource);
+            }
+            rtvs.push(host.rtv(texture, desc.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -1092,6 +1102,8 @@ impl State {
                     {
                         emit_uav_barrier(list);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::scene_color::note_draw(self.depth, &self.targets, &self.target_views);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1360,6 +1372,8 @@ impl State {
             {
                 emit_uav_barrier(list);
             }
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth, &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1452,6 +1466,8 @@ impl State {
             {
                 emit_uav_barrier(list);
             }
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth, &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1634,6 +1650,8 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth, &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
@@ -2617,3 +2635,4 @@ mod tests {
         assert_eq!(release(pso), 0);
     }
 }
+

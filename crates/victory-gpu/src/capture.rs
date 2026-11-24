@@ -80,17 +80,17 @@ pub(crate) fn wanted(n: u64) -> bool {
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
-    let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
-    for y in 0..h as usize {
-        raw.push(0);
+    // Each row starts with a zero filter byte, followed by downsampled RGB.
+    let row_bytes = w as usize * 3 + 1;
+    let mut raw = vec![0; row_bytes * h as usize];
+    for (y, scanline) in raw.chunks_exact_mut(row_bytes).enumerate() {
         let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
-        for x in 0..w as usize {
+        for (x, pixel) in scanline[1..].chunks_exact_mut(3).enumerate() {
             let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
             if bgra {
-                raw.extend([p[2], p[1], p[0]]);
+                pixel.copy_from_slice(&[p[2], p[1], p[0]]);
             } else {
-                raw.extend_from_slice(p);
+                pixel.copy_from_slice(p);
             }
         }
     }
@@ -122,13 +122,26 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend(crc.to_be_bytes());
 }
 
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut byte = 0;
+    while byte < table.len() {
+        let mut crc = byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+            bit += 1;
+        }
+        table[byte] = crc;
+        byte += 1;
+    }
+    table
+};
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
-    for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-        }
+    for &byte in bytes {
+        crc = (crc >> 8) ^ CRC32_TABLE[usize::from((crc as u8) ^ byte)];
     }
     !crc
 }
@@ -223,12 +236,14 @@ pub(crate) fn save_read_back(
 }
 
 /// Saves the preview actually copied into the swap chain's back buffer.
-pub(crate) fn save_presented_depth(
+pub(crate) fn save_presented_preview(
     frame: u64,
+    color: bool,
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
-    save_color_readback(&format!("frame-{frame}-presented-depth"), buffer, footprint);
+    let mode = if color { "color" } else { "depth" };
+    save_color_readback(&format!("frame-{frame}-presented-{mode}"), buffer, footprint);
 }
 
 fn save_color_readback(
@@ -313,6 +328,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
             *LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
         }
     }
+    crate::scene_color::note_bound(resource);
     if !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
@@ -348,11 +364,12 @@ pub(crate) fn dump_targets(frame: u64) {
 }
 
 /// The latest usable depth sample, converted to tightly packed RGBA8.
-pub(crate) struct SceneDepthPreview {
+pub(crate) struct ScenePreview {
     pub(crate) frame: u64,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) rgba: Vec<u8>,
+    pub(crate) color: bool,
 }
 
 const DEPTH_SAMPLE_GAP: u64 = 4;
@@ -371,7 +388,7 @@ struct SceneDepthCapture {
     drawn: u64,
     dispatched: u64,
     pending: BTreeMap<u64, DepthCandidates>,
-    latest: Option<Arc<SceneDepthPreview>>,
+    latest: Option<Arc<ScenePreview>>,
 }
 
 #[derive(Default)]
@@ -385,7 +402,7 @@ fn scene_depth_on() -> bool {
     *ON.get_or_init(|| matches!(std::env::var("VICTORY_PREVIEW_SCENE_DEPTH").as_deref(), Ok("1")))
 }
 
-pub(crate) fn scene_depth_preview() -> Option<Arc<SceneDepthPreview>> {
+pub(crate) fn scene_depth_preview() -> Option<Arc<ScenePreview>> {
     if !scene_depth_on() {
         return None;
     }
@@ -478,13 +495,19 @@ pub(crate) fn sample_scene_depth(frame: u64) {
     let Some(readback) = read_back(&host.device, &list.list, &texture.texture) else {
         return;
     };
-    let Some((width, height, rgba)) = read_target_rgba(host, &list, readback) else {
+    let Some((width, height, rgba)) = read_target_rgba(host, &list, readback, None) else {
         return;
     };
     if usable_depth(&rgba) {
         let mut capture = SCENE_DEPTH.lock().unwrap_or_else(|e| e.into_inner());
         if capture.latest.as_ref().is_none_or(|last| last.frame < frame) {
-            capture.latest = Some(Arc::new(SceneDepthPreview { frame, width, height, rgba }));
+            capture.latest = Some(Arc::new(ScenePreview {
+                frame,
+                width,
+                height,
+                rgba,
+                color: false,
+            }));
             tracing::info!(frame, width, height, "live scene depth preview updated");
         }
     }
@@ -522,13 +545,26 @@ fn dump_target_rgba(
         }
         read
     };
-    read_target_rgba(host, &list, read?)
+    read_target_rgba(host, &list, read?, None)
+}
+
+/// Read a scene texture using the command list's submission-time state tracking.
+pub(crate) fn read_scene_color(
+    host: &crate::host::Host,
+    copy: Arc<crate::resource::HostTexture>,
+    format: DXGI_FORMAT,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let list = host.new_list().ok()?;
+    let readback = read_back(&host.device, &list.list, &copy.texture)?;
+    let _ = list.track_texture_state(copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+    read_target_rgba(host, &list, readback, Some(format))
 }
 
 fn read_target_rgba(
     host: &crate::host::Host,
     list: &crate::host::HostList,
     (buffer, footprint): (ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT),
+    format: Option<DXGI_FORMAT>,
 ) -> Option<(u32, u32, Vec<u8>)> {
     list.close();
     host.execute(&[list]);
@@ -543,7 +579,8 @@ fn read_target_rgba(
         buffer.Map(0, None, Some(&mut data)).ok()?;
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        let rgba = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows);
+        let format = format.unwrap_or(f.Format);
+        let rgba = to_rgba(format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows);
         buffer.Unmap(0, None);
         rgba
     };
@@ -669,6 +706,15 @@ pub(crate) fn probe(
     if !matches!(d.Format.0, 27..=29 | 87 | 90 | 91) {
         return None;
     }
+    probe_grid(device, list, texture, d)
+}
+
+fn probe_grid(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    d: D3D12_RESOURCE_DESC,
+) -> Option<ID3D12Resource> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: SLOT * u64::from(GRID * GRID),
@@ -739,6 +785,52 @@ pub(crate) fn probe(
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&pixel));
         }
         Some(buffer)
+    }
+}
+
+/// Record a sparse diagnostic grid on a scene candidate already checked for
+/// dimensions, sample count, and format by the preview.
+pub(crate) fn record_scene_grid(
+    host: &crate::host::Host,
+    list: &crate::host::HostList,
+    copy: Arc<crate::resource::HostTexture>,
+    desc: D3D12_RESOURCE_DESC,
+) -> Option<ID3D12Resource> {
+    let buffer = probe_grid(&host.device, &list.list, &copy.texture, desc)?;
+    let _ = list.track_texture_state(copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+    Some(buffer)
+}
+
+/// Whether the completed grid contains a finite RGB component above the floor.
+pub(crate) fn scene_grid_has_color(buffer: &ID3D12Resource, format: DXGI_FORMAT) -> bool {
+    let floor = if matches!(format.0, 10 | 26) { 0.0001 } else { 8.0 / 255.0 };
+    let mut mapped = std::ptr::null_mut();
+    // SAFETY: the caller checked the completion fence and the buffer covers all grid slots.
+    unsafe {
+        if buffer.Map(0, None, Some(&mut mapped)).is_err() {
+            return false;
+        }
+        let bytes = std::slice::from_raw_parts(
+            mapped.cast::<u8>(),
+            (SLOT * u64::from(GRID * GRID)) as usize,
+        );
+        let found = bytes.chunks_exact(SLOT as usize).any(|pixel| {
+            let packed = u32::from_le_bytes(pixel[..4].try_into().expect("grid pixel"));
+            let rgb = match format.0 {
+                10 => [0, 2, 4].map(|i| half(u16::from_le_bytes([pixel[i], pixel[i + 1]]))),
+                24 => [0, 10, 20].map(|i| ((packed >> i) & 0x3ff) as f32 / 1023.0),
+                26 => [
+                    small_float(packed & 0x7ff, 6),
+                    small_float((packed >> 11) & 0x7ff, 6),
+                    small_float(packed >> 22, 5),
+                ],
+                // For this threshold the RGB and BGR channel orders are equivalent.
+                _ => [0, 1, 2].map(|i| f32::from(pixel[i]) / 255.0),
+            };
+            rgb.into_iter().any(|channel| channel.is_finite() && channel.abs() > floor)
+        });
+        buffer.Unmap(0, None);
+        found
     }
 }
 

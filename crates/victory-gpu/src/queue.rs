@@ -286,6 +286,8 @@ extern "system" fn present(
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
+        #[cfg(feature = "diagnostics")]
+        crate::scene_color::sample(host, frame, resource as usize);
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes `planes` plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
