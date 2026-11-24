@@ -4527,7 +4527,9 @@ impl<'a> Lower<'a> {
         let element = self.s.m.bin(c, Bin::Mul, index, stride);
         let byte = self.s.m.bin(c, Bin::Add, element, off);
         let byte = self.s.m.bin(c, Bin::Add, byte, bias);
-        Ok((self.s.heap_handle(c, raw, false, (props, 0)), byte))
+        // heap_slot currently accepts only scalar Loaded/Phi descriptors;
+        // per-lane choices remain refused rather than mislabelled uniform.
+        Ok((self.s.heap_handle(c, raw, false, false, (props, 0)), byte))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar

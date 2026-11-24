@@ -1359,9 +1359,9 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
         let mut l = super::lower::lower(&super::lower::Parts {
             native: &native,
             p: &p,
@@ -1372,6 +1372,9 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .unwrap();
         assert!(l.stride_table);
@@ -1402,6 +1405,18 @@ mod tests {
             root_srvs: l.root_srvs,
             stride_table: l.stride_table,
         }
+    }
+
+    #[cfg(windows)]
+    fn stride_user_data(cs: &super::HostShader, first: u32, views: usize) -> Vec<u32> {
+        let mut values = vec![0; cs.user_data_dwords() as usize];
+        values[0] = first;
+        for u in &cs.user_data {
+            if let Some(guard) = super::host::guard(u.root, views, 0) {
+                values[u.index as usize] = guard;
+            }
+        }
+        values
     }
 
     /// The hardware adapter and WARP, those there are.
@@ -1543,7 +1558,7 @@ mod tests {
                     &pso,
                     &Dispatch {
                         roots: vec![
-                            (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (0, Root::Constants(stride_user_data(&cs, 0, views.len()))),
                             (
                                 1,
                                 Root::View {
@@ -1566,6 +1581,267 @@ mod tests {
             want[at(2, 0)] = 20;
             assert_eq!(out[0], want, "{kind} on {name}");
         }
+    }
+
+    #[test]
+    fn structured_buffer_unknown_stride_uses_runtime_stride_table() {
+        // Translated and validated on every host; run where there is a GPU.
+        let _ = unknown_stride_program(
+            &[
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                0x7E00_0282, // v_mov_b32 v0, 2
+                0x7E02_0284, // v_mov_b32 v1, 4
+                0xE030_3000,
+                0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+                0xBF81_0000, // s_endpgm
+            ],
+            8,
+            ONE_THREAD,
+        );
+        #[cfg(windows)]
+        for (name, host) in hosts() {
+            unknown_stride_views_read_their_bytes(name, &host);
+        }
+    }
+
+    /// The heap slot of an unknown-stride read loaded from a buffer at run
+    /// time, per thread group: each group's lanes read the bytes of the
+    /// view in the slot their group chose (a structured view of 12 bytes in
+    /// one, of 16 in the other), since the table entry is looked up by the
+    /// same computed slot the handle is made from. A lane reading past the
+    /// chosen view's elements reads zero, not the buffer's next bytes: the
+    /// raw view ends where the view does.
+    #[test]
+    fn unknown_stride_views_chosen_by_a_loaded_heap_index() {
+        let words: &[u32] = &[
+            0xBE94_0304, // s_mov_b32 s20, s4
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0xF408_040A,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[20:21], 0x0
+            0x8F07_8205, // s_lshl_b32 s7, s5, 2
+            0xF420_0188,
+            0x0E00_0000, // s_buffer_load_dword s6, s[16:19], s7
+            0x8F06_8506, // s_lshl_b32 s6, s6, 5
+            0xF408_020A,
+            0x0C00_0000, // s_load_dwordx4 s[8:11], s[20:21], s6
+            0xF408_030A,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[20:21], 0x20
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x8F07_8405, // s_lshl_b32 s7, s5, 4
+            0x7E02_0207, // v_mov_b32 v1, s7
+            0xE070_3000,
+            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0xBF81_0000, // s_endpgm
+        ];
+        // Four threads (v0: the thread's id), the group's id in s5 after
+        // the user SGPRs s0..s4.
+        let l = unknown_stride_program(
+            words,
+            8,
+            crate::native::ComputeIo {
+                rsrc2: 5 << 1 | 1 << 7,
+                threads: [4, 1, 1],
+            },
+        );
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
+        {
+            use super::StrideEntry;
+            use super::host::{Dispatch, Root, Stride, View};
+            let cs = compute_shader(l);
+            let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
+            // Slot 2: three elements of 12 bytes; slot 3: four of 16 bytes
+            // from element 1; their raw views in slots 4 and 5.
+            let (raw_a, entry_a) = raw_view_of(2, 4, (0, 3, 12));
+            let (raw_b, entry_b) = raw_view_of(3, 5, (1, 4, 16));
+            let raw = StrideEntry {
+                stride: 4,
+                ..StrideEntry::default()
+            };
+            let table: Vec<u32> = [raw, raw, entry_a, entry_b]
+                .into_iter()
+                .flat_map(StrideEntry::words)
+                .collect();
+            // Lane `l` reads [l, 4]: of the first view dwords 1, 4, 7 and
+            // (past its three elements) nothing, of the second 5, 9, 13, 17.
+            let of_a = [101, 104, 107, 0];
+            let of_b = [205, 209, 213, 217];
+            for (name, host) in hosts() {
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                // The slot each of the two groups reads, in the buffer in
+                // slot 0.
+                for (slots, want) in [([2, 3], [of_a, of_b]), ([3, 2], [of_b, of_a])] {
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(stride_user_data(&cs, 0, 6))),
+                                    (
+                                        1,
+                                        Root::View {
+                                            srv: true,
+                                            data: table.clone(),
+                                        },
+                                    ),
+                                ],
+                                views: &[
+                                    View::Buffer {
+                                        data: &slots,
+                                        stride: Stride::Raw,
+                                    },
+                                    View::RawUav(8),
+                                    View::Buffer {
+                                        data: &a,
+                                        stride: Stride::Structured(12),
+                                    },
+                                    View::Buffer {
+                                        data: &b,
+                                        stride: Stride::Structured(16),
+                                    },
+                                    raw_a,
+                                    raw_b,
+                                ],
+                                samplers: &[],
+                                groups: [2, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(out[0], want.concat(), "slots {slots:?} on {name}");
+                }
+            }
+        }
+    }
+
+    /// The descriptor of an unknown-stride read chosen by control flow: the
+    /// table entry read is the chosen slot's.
+    #[test]
+    fn unknown_stride_descriptor_chosen_by_control_flow() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0003, // s_cbranch_scc1 -> 0x18
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xBF82_0002, // s_branch -> 0x20
+            0xF408_0202,
+            0xFA00_0020, // 0x18: s_load_dwordx4 s[8:11], s[4:5], 0x20
+            0xF408_0302,
+            0xFA00_0040, // 0x20: s_load_dwordx4 s[12:15], s[4:5], 0x40
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0288, // v_mov_b32 v1, 8
+            0xE070_3000,
+            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = unknown_stride_program(words, 16, ONE_THREAD);
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
+        {
+            use super::StrideEntry;
+            use super::host::{Dispatch, Root, Stride, View};
+            let cs = compute_shader(l);
+            let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
+            // Slots 0 and 1: structured views of 12 and 16 bytes, their raw
+            // views in slots 3 and 4; slot 2: a raw unordered view.
+            let (raw_a, entry_a) = raw_view_of(0, 3, (0, 21, 12));
+            let (raw_b, entry_b) = raw_view_of(1, 4, (0, 16, 16));
+            let raw = StrideEntry {
+                stride: 4,
+                ..StrideEntry::default()
+            };
+            let table: Vec<u32> = [entry_a, entry_b, raw]
+                .into_iter()
+                .flat_map(StrideEntry::words)
+                .collect();
+            for (name, host) in hosts() {
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                // s0: 1 takes the first load, 0 the second.
+                for (s0, want) in [(1, 107), (0, 209)] {
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(stride_user_data(&cs, s0, 5))),
+                                    (
+                                        1,
+                                        Root::View {
+                                            srv: true,
+                                            data: table.clone(),
+                                        },
+                                    ),
+                                ],
+                                views: &[
+                                    View::Buffer {
+                                        data: &a,
+                                        stride: Stride::Structured(12),
+                                    },
+                                    View::Buffer {
+                                        data: &b,
+                                        stride: Stride::Structured(16),
+                                    },
+                                    View::RawUav(16),
+                                    raw_a,
+                                    raw_b,
+                                ],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    // Stored at [1, 8] of the raw view: stride 4, dword 3.
+                    assert_eq!(out[0][3], want, "s0 = {s0} on {name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stride_entries_name_the_raw_view_and_its_bias() {
+        use super::{RawWindow, StrideEntry};
+        // No raw slot: the slot's own view, whatever the table held before.
+        assert_eq!(StrideEntry::default().words(), [0, 0]);
+        let own = StrideEntry {
+            stride: 4,
+            raw_slot: None,
+            bias: 0,
+        };
+        assert_eq!(own.words(), [4, 0]);
+        let aliased = StrideEntry {
+            stride: 12,
+            raw_slot: Some(0),
+            bias: 12,
+        };
+        assert_eq!(aliased.words(), [12, 1 | 12 << 28]);
+        // A view on 16 bytes starts its raw view; one 4 to 12 bytes past
+        // starts it early, and the raw view covers the bytes before too.
+        let window = |first, dwords, bias| {
+            Some(RawWindow {
+                first,
+                dwords,
+                bias,
+            })
+        };
+        assert_eq!(RawWindow::covering(32, 24), window(8, 6, 0));
+        assert_eq!(RawWindow::covering(36, 24), window(8, 7, 4));
+        assert_eq!(RawWindow::covering(44, 22), window(8, 9, 12));
+        assert_eq!(RawWindow::covering(0, 0), window(0, 1, 0));
+        // Off a dword: no raw view reads it.
+        assert_eq!(RawWindow::covering(34, 24), None);
+        assert_eq!(RawWindow::covering(16, 4 << 32), None);
     }
 
     #[test]
@@ -2265,264 +2541,5 @@ mod barycentric_tests {
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
 
-    #[test]
-    fn structured_buffer_unknown_stride_uses_runtime_stride_table() {
-        // Translated and validated on every host; run where there is a GPU.
-        let _ = unknown_stride_program(
-            &[
-                0xBE85_0380, // s_mov_b32 s5, 0
-                0xF408_0202,
-                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
-                0x7E00_0282, // v_mov_b32 v0, 2
-                0x7E02_0284, // v_mov_b32 v1, 4
-                0xE030_3000,
-                0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
-                0xBF81_0000, // s_endpgm
-            ],
-            8,
-            ONE_THREAD,
-        );
-        #[cfg(windows)]
-        for (name, host) in hosts() {
-            unknown_stride_views_read_their_bytes(name, &host);
-        }
-    }
 
-    /// The heap slot of an unknown-stride read loaded from a buffer at run
-    /// time, per thread group: each group's lanes read the bytes of the
-    /// view in the slot their group chose (a structured view of 12 bytes in
-    /// one, of 16 in the other), since the table entry is looked up by the
-    /// same computed slot the handle is made from. A lane reading past the
-    /// chosen view's elements reads zero, not the buffer's next bytes: the
-    /// raw view ends where the view does.
-    #[test]
-    fn unknown_stride_views_chosen_by_a_loaded_heap_index() {
-        let words: &[u32] = &[
-            0xBE94_0304, // s_mov_b32 s20, s4
-            0xBE95_0380, // s_mov_b32 s21, 0
-            0xF408_040A,
-            0xFA00_0000, // s_load_dwordx4 s[16:19], s[20:21], 0x0
-            0x8F07_8205, // s_lshl_b32 s7, s5, 2
-            0xF420_0188,
-            0x0E00_0000, // s_buffer_load_dword s6, s[16:19], s7
-            0x8F06_8506, // s_lshl_b32 s6, s6, 5
-            0xF408_020A,
-            0x0C00_0000, // s_load_dwordx4 s[8:11], s[20:21], s6
-            0xF408_030A,
-            0xFA00_0020, // s_load_dwordx4 s[12:15], s[20:21], 0x20
-            0x7E02_0284, // v_mov_b32 v1, 4
-            0xE030_3000,
-            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
-            0x8F07_8405, // s_lshl_b32 s7, s5, 4
-            0x7E02_0207, // v_mov_b32 v1, s7
-            0xE070_3000,
-            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
-            0xBF81_0000, // s_endpgm
-        ];
-        // Four threads (v0: the thread's id), the group's id in s5 after
-        // the user SGPRs s0..s4.
-        let l = unknown_stride_program(
-            words,
-            8,
-            crate::native::ComputeIo {
-                rsrc2: 5 << 1 | 1 << 7,
-                threads: [4, 1, 1],
-            },
-        );
-        #[cfg(not(windows))]
-        let _ = l;
-        #[cfg(windows)]
-        {
-            use super::StrideEntry;
-            use super::host::{Dispatch, Root, Stride, View};
-            let cs = compute_shader(l);
-            let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
-            // Slot 2: three elements of 12 bytes; slot 3: four of 16 bytes
-            // from element 1; their raw views in slots 4 and 5.
-            let (raw_a, entry_a) = raw_view_of(2, 4, (0, 3, 12));
-            let (raw_b, entry_b) = raw_view_of(3, 5, (1, 4, 16));
-            let raw = StrideEntry {
-                stride: 4,
-                ..StrideEntry::default()
-            };
-            let table: Vec<u32> = [raw, raw, entry_a, entry_b]
-                .into_iter()
-                .flat_map(StrideEntry::words)
-                .collect();
-            // Lane `l` reads [l, 4]: of the first view dwords 1, 4, 7 and
-            // (past its three elements) nothing, of the second 5, 9, 13, 17.
-            let of_a = [101, 104, 107, 0];
-            let of_b = [205, 209, 213, 217];
-            for (name, host) in hosts() {
-                let (root, pso) = host.compute_pipeline(&cs).unwrap();
-                // The slot each of the two groups reads, in the buffer in
-                // slot 0.
-                for (slots, want) in [([2, 3], [of_a, of_b]), ([3, 2], [of_b, of_a])] {
-                    let out = host
-                        .dispatch(
-                            &root,
-                            &pso,
-                            &Dispatch {
-                                roots: vec![
-                                    (0, Root::Constants(vec![0, 0, 0, 0, 0])),
-                                    (
-                                        1,
-                                        Root::View {
-                                            srv: true,
-                                            data: table.clone(),
-                                        },
-                                    ),
-                                ],
-                                views: &[
-                                    View::Buffer {
-                                        data: &slots,
-                                        stride: Stride::Raw,
-                                    },
-                                    View::RawUav(8),
-                                    View::Buffer {
-                                        data: &a,
-                                        stride: Stride::Structured(12),
-                                    },
-                                    View::Buffer {
-                                        data: &b,
-                                        stride: Stride::Structured(16),
-                                    },
-                                    raw_a,
-                                    raw_b,
-                                ],
-                                samplers: &[],
-                                groups: [2, 1, 1],
-                            },
-                        )
-                        .unwrap();
-                    assert_eq!(out[0], want.concat(), "slots {slots:?} on {name}");
-                }
-            }
-        }
-    }
-
-    /// The descriptor of an unknown-stride read chosen by control flow: the
-    /// table entry read is the chosen slot's.
-    #[test]
-    fn unknown_stride_descriptor_chosen_by_control_flow() {
-        let words: &[u32] = &[
-            0xBE85_0380, // s_mov_b32 s5, 0
-            0xBF06_8000, // s_cmp_eq_u32 s0, 0
-            0xBF85_0003, // s_cbranch_scc1 -> 0x18
-            0xF408_0202,
-            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
-            0xBF82_0002, // s_branch -> 0x20
-            0xF408_0202,
-            0xFA00_0020, // 0x18: s_load_dwordx4 s[8:11], s[4:5], 0x20
-            0xF408_0302,
-            0xFA00_0040, // 0x20: s_load_dwordx4 s[12:15], s[4:5], 0x40
-            0x7E00_0282, // v_mov_b32 v0, 2
-            0x7E02_0284, // v_mov_b32 v1, 4
-            0xE030_3000,
-            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
-            0x7E00_0281, // v_mov_b32 v0, 1
-            0x7E02_0288, // v_mov_b32 v1, 8
-            0xE070_3000,
-            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
-            0xBF81_0000, // s_endpgm
-        ];
-        let l = unknown_stride_program(words, 16, ONE_THREAD);
-        #[cfg(not(windows))]
-        let _ = l;
-        #[cfg(windows)]
-        {
-            use super::StrideEntry;
-            use super::host::{Dispatch, Root, Stride, View};
-            let cs = compute_shader(l);
-            let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
-            // Slots 0 and 1: structured views of 12 and 16 bytes, their raw
-            // views in slots 3 and 4; slot 2: a raw unordered view.
-            let (raw_a, entry_a) = raw_view_of(0, 3, (0, 21, 12));
-            let (raw_b, entry_b) = raw_view_of(1, 4, (0, 16, 16));
-            let raw = StrideEntry {
-                stride: 4,
-                ..StrideEntry::default()
-            };
-            let table: Vec<u32> = [entry_a, entry_b, raw]
-                .into_iter()
-                .flat_map(StrideEntry::words)
-                .collect();
-            for (name, host) in hosts() {
-                let (root, pso) = host.compute_pipeline(&cs).unwrap();
-                // s0: 1 takes the first load, 0 the second.
-                for (s0, want) in [(1, 107), (0, 209)] {
-                    let out = host
-                        .dispatch(
-                            &root,
-                            &pso,
-                            &Dispatch {
-                                roots: vec![
-                                    (0, Root::Constants(vec![s0, 0, 0, 0, 0])),
-                                    (
-                                        1,
-                                        Root::View {
-                                            srv: true,
-                                            data: table.clone(),
-                                        },
-                                    ),
-                                ],
-                                views: &[
-                                    View::Buffer {
-                                        data: &a,
-                                        stride: Stride::Structured(12),
-                                    },
-                                    View::Buffer {
-                                        data: &b,
-                                        stride: Stride::Structured(16),
-                                    },
-                                    View::RawUav(16),
-                                    raw_a,
-                                    raw_b,
-                                ],
-                                samplers: &[],
-                                groups: [1, 1, 1],
-                            },
-                        )
-                        .unwrap();
-                    // Stored at [1, 8] of the raw view: stride 4, dword 3.
-                    assert_eq!(out[0][3], want, "s0 = {s0} on {name}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn stride_entries_name_the_raw_view_and_its_bias() {
-        use super::{RawWindow, StrideEntry};
-        // No raw slot: the slot's own view, whatever the table held before.
-        assert_eq!(StrideEntry::default().words(), [0, 0]);
-        let own = StrideEntry {
-            stride: 4,
-            raw_slot: None,
-            bias: 0,
-        };
-        assert_eq!(own.words(), [4, 0]);
-        let aliased = StrideEntry {
-            stride: 12,
-            raw_slot: Some(0),
-            bias: 12,
-        };
-        assert_eq!(aliased.words(), [12, 1 | 12 << 28]);
-        // A view on 16 bytes starts its raw view; one 4 to 12 bytes past
-        // starts it early, and the raw view covers the bytes before too.
-        let window = |first, dwords, bias| {
-            Some(RawWindow {
-                first,
-                dwords,
-                bias,
-            })
-        };
-        assert_eq!(RawWindow::covering(32, 24), window(8, 6, 0));
-        assert_eq!(RawWindow::covering(36, 24), window(8, 7, 4));
-        assert_eq!(RawWindow::covering(44, 22), window(8, 9, 12));
-        assert_eq!(RawWindow::covering(0, 0), window(0, 1, 0));
-        // Off a dword: no raw view reads it.
-        assert_eq!(RawWindow::covering(34, 24), None);
-        assert_eq!(RawWindow::covering(16, 4 << 32), None);
-    }
 }

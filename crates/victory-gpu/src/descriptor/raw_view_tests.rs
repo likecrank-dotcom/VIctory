@@ -115,7 +115,7 @@ fn program() -> HostShader {
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = victory_shader::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
+    let res = victory_shader::resource::track(&p, &native.layout, native.stage, None).unwrap();
     let io = victory_shader::io::raise(&p, &native).unwrap();
     let st = victory_shader::structure::structure(&p).unwrap();
     // An empty container (no signature parts): the tag, a digest, version
@@ -124,7 +124,9 @@ fn program() -> HostShader {
     container.extend([0; 16]);
     container.extend([1u32, 32, 0].into_iter().flat_map(u32::to_le_bytes));
     let c = victory_shader::Container::parse(&container).unwrap();
-    let cs = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+    let cs = victory_shader::emit::emit(
+        &c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY,
+    ).unwrap();
     assert!(cs.stride_table);
     cs
 }
@@ -201,9 +203,18 @@ fn dispatch(
     heap: &HostHeap,
     root: &ID3D12RootSignature,
     pso: &ID3D12PipelineState,
-    user_data: u32,
+    cs: &HostShader,
 ) -> windows::core::Result<()> {
-    let zeros = vec![0u32; user_data as usize];
+    let user_data = cs.user_data_dwords();
+    let mut values = vec![0u32; user_data as usize];
+    // This stack guards heap indices through extra user-data constants.
+    // Bind the same guard that the runtime draw path supplies, rather than
+    // clamping every test access to the null descriptor at slot zero.
+    for u in &cs.user_data {
+        if u.root == RootType::ResourceHeap {
+            values[u.index as usize] = heap.guard_slot();
+        }
+    }
     // SAFETY: an open list with every root argument set; the heap, its
     // table and the buffers its views read outlive the wait.
     unsafe {
@@ -217,7 +228,7 @@ fn dispatch(
             device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso)?;
         list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
         list.SetComputeRootSignature(root);
-        list.SetComputeRoot32BitConstants(0, user_data, zeros.as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(0, user_data, values.as_ptr().cast(), 0);
         list.SetComputeRootShaderResourceView(1, heap.stride_table_gpu().expect("a table"));
         list.Dispatch(2, 1, 1);
         list.Close()?;
@@ -320,7 +331,7 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
         unsafe {
             slots_copy.cast::<[u32; 2]>().write(chosen);
             out.add(5).cast::<[u32; 8]>().write([0; 8]);
-            dispatch(device, &heap, &root, &pso, cs.user_data_dwords()).expect("a dispatch");
+            dispatch(device, &heap, &root, &pso, &cs).expect("a dispatch");
             out.add(5).cast::<[u32; 8]>().read()
         }
     };
