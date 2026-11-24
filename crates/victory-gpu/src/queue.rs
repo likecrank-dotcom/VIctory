@@ -286,11 +286,16 @@ extern "system" fn present(
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
-        #[cfg(feature = "diagnostics")]
-        crate::scene_color::sample(host, frame, resource as usize);
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes `planes` plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(plane) = slice.iter().find(|p| p.count > 0 && !p.resources.is_null()) {
+            // Sample before changing any plane's tracked host state.
+            // SAFETY: a nonempty plane's first live resource, as in the loop below.
+            let resource = unsafe { *plane.resources };
+            crate::scene_color::sample(host, frame, resource as usize);
+        }
         let mut resources = Vec::with_capacity(slice.len());
         for plane in slice {
             if plane.count == 0 || plane.resources.is_null() {
